@@ -145,8 +145,18 @@ function nextStamp() {
   return EPOCH_SEC + logicalSeq;
 }
 
+// isoOf is a pure function of the second; timestamps repeat constantly
+// (every object stamped in the same logical second), so memoize it.
+const isoCache = new Map();
+
 function isoOf(sec) {
-  return new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  let out = isoCache.get(sec);
+  if (out === undefined) {
+    out = new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    if (isoCache.size > 8192) isoCache.clear();
+    isoCache.set(sec, out);
+  }
+  return out;
 }
 
 function stampIso() {
@@ -176,8 +186,8 @@ function sha1Hex(buffer) {
 }
 
 function hashObject(type, data) {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  // Same digest as sha1(header || data) without materializing the concat.
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'utf8').update(data).digest('hex');
 }
 
 function storeObject(type, data) {
@@ -578,7 +588,15 @@ function packEntryHeader(typeId, size) {
 }
 
 // A version-2 pack holding exactly `oids` (plain objects, no deltas).
+// The object store is immutable and content-addressed, so a pack is a pure
+// function of its oid list: cache it. Repeated fetches of the same tips
+// (the clone pattern) then skip every deflate after the first build.
+const packCache = new Map();
+
 function buildPack(oids) {
+  const cacheKey = oids.join(' ');
+  const cached = packCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const parts = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
@@ -593,7 +611,10 @@ function buildPack(oids) {
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const pack = Buffer.concat([body, trailer]);
+  if (packCache.size > 128) packCache.clear();
+  packCache.set(cacheKey, pack);
+  return pack;
 }
 
 // --- fetch object selection --------------------------------------------------
@@ -819,6 +840,12 @@ function repoKey(owner, name) {
   return `${owner.toLowerCase()}/${name.toLowerCase()}`;
 }
 
+// Every ref mutation bumps repo.refsVersion (all five sites call this), so
+// ref-derived response caches can validate with one integer compare.
+function touchRefs(repo) {
+  repo.refsVersion += 1;
+}
+
 function createRepo({ name, description, isPrivate }) {
   const sec = nextStamp();
   const repo = {
@@ -829,6 +856,7 @@ function createRepo({ name, description, isPrivate }) {
     private: isPrivate ?? false,
     defaultBranch: 'main',
     refs: new Map(),
+    refsVersion: 0,
     labels: new Map(),
     issues: new Map(),
     pulls: new Map(),
@@ -903,6 +931,7 @@ function applyContentsChange(repo, branch, path, content, message) {
   }
   const commit = commitFlatTree(repo, tip, flat, message);
   repo.refs.set(`refs/heads/${branch}`, commit);
+  touchRefs(repo);
   return { commit, created: existing === undefined };
 }
 
@@ -1014,6 +1043,7 @@ function mergePullRequest(repo, pull, method) {
     }
   }
   repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
+  touchRefs(repo);
   const sec = nextStamp();
   pull.state = 'closed';
   pull.merged = true;
@@ -1070,6 +1100,22 @@ function issueJson(repo, issue) {
     updated_at: isoOf(issue.updatedSec),
     html_url: `https://github.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
+}
+
+// The serialized bytes of one issue, cached on the issue itself. Every input
+// of issueJson is covered by the fingerprint: title/body/state/labels edits
+// and closes all bump updatedSec (REST PATCH, GraphQL closeIssue, MCP
+// close_issue), comment appends change comments.length, and a label created
+// after the fact changes repo.labels.size. Label records are immutable once
+// created and repo id/owner/name never change, so a fingerprint match means
+// the bytes are exactly what issueJson would produce now.
+function issueJsonBuffer(repo, issue) {
+  const key = `${issue.updatedSec}|${issue.comments.length}|${repo.labels.size}`;
+  if (issue._jsonKey === key && issue._jsonBuf !== undefined) return issue._jsonBuf;
+  const buf = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
+  issue._jsonKey = key;
+  issue._jsonBuf = buf;
+  return buf;
 }
 
 function commentJson(comment) {
@@ -1140,8 +1186,17 @@ function commitJson(oid) {
 
 // Opaque global ids for GraphQL/node(): base64url of "Type:payload". They are
 // stable, decodable by this forge, and never the plain database id.
+const globalIdCache = new Map();
+
 function globalId(type, payload) {
-  return Buffer.from(`${type}:${payload}`, 'utf8').toString('base64url');
+  const key = `${type}:${payload}`;
+  let out = globalIdCache.get(key);
+  if (out === undefined) {
+    out = Buffer.from(key, 'utf8').toString('base64url');
+    if (globalIdCache.size > 8192) globalIdCache.clear();
+    globalIdCache.set(key, out);
+  }
+  return out;
 }
 
 function parseGlobalId(id) {
@@ -1193,13 +1248,14 @@ function pullByGlobalId(id) {
 // ---------------------------------------------------------------------------
 
 const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+const EXPECTED_AUTH = SHOP_TOKEN === '' ? null : `Bearer ${SHOP_TOKEN}`;
+const EXPECTED_AUTH_BUF = EXPECTED_AUTH === null ? null : Buffer.from(EXPECTED_AUTH, 'utf8');
 
 function tokenOk(req) {
-  if (SHOP_TOKEN === '') return true; // standalone dev mode: no token configured
+  if (EXPECTED_AUTH === null) return true; // standalone dev mode: no token configured
   const header = req.headers.authorization ?? '';
-  const expected = `Bearer ${SHOP_TOKEN}`;
-  if (header.length !== expected.length) return false;
-  return timingSafeEqual(Buffer.from(header), Buffer.from(expected));
+  if (header.length !== EXPECTED_AUTH.length) return false;
+  return timingSafeEqual(Buffer.from(header, 'utf8'), EXPECTED_AUTH_BUF);
 }
 
 function readBody(req) {
@@ -1213,6 +1269,19 @@ function readBody(req) {
 
 function sendJson(res, status, value, extraHeaders = {}) {
   const body = Buffer.from(JSON.stringify(value), 'utf8');
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': body.length,
+    'x-github-request-id': `req-${(requestSeq += 1)}`,
+    ...extraHeaders,
+  });
+  res.end(body);
+}
+
+const HEALTHZ_BODY = Buffer.from('{"ok":true}', 'utf8');
+
+// Send a prebuilt JSON body (a cached serialization) with sendJson's headers.
+function sendJsonBuffer(res, status, body, extraHeaders = {}) {
   res.writeHead(status, {
     'content-type': 'application/json',
     'content-length': body.length,
@@ -1284,6 +1353,16 @@ function v0RefLines(repo, capabilities) {
   return lines;
 }
 
+// The protocol-v2 upload-pack advertisement is constant: build it once.
+const UPLOAD_V2_ADVERTISEMENT = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT_STRING}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 function handleInfoRefs(req, res, repo, service, url) {
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
     sendBytes(res, 400, Buffer.from('invalid service\n'), 'text/plain');
@@ -1291,15 +1370,14 @@ function handleInfoRefs(req, res, repo, service, url) {
   }
   const wantsV2 = (req.headers['git-protocol'] ?? '').includes('version=2');
   if (service === 'git-upload-pack' && wantsV2) {
-    const parts = [
-      pktLine('version 2\n'),
-      pktLine(`agent=${AGENT_STRING}\n`),
-      pktLine('ls-refs=unborn\n'),
-      pktLine('fetch=shallow\n'),
-      pktLine('object-format=sha1\n'),
-      PKT_FLUSH,
-    ];
-    sendBytes(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-advertisement');
+    sendBytes(res, 200, UPLOAD_V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
+    return;
+  }
+  // The v0 advertisement is a pure function of the repo's refs: cache it
+  // against refsVersion (the HEAD target is the immutable defaultBranch).
+  const advCache = repo._advCache;
+  if (advCache !== undefined && advCache.version === repo.refsVersion && advCache.service === service) {
+    sendBytes(res, 200, advCache.body, `application/x-${service}-advertisement`);
     return;
   }
   const preamble = service === 'git-upload-pack' ? '# service=git-upload-pack\n' : '# service=git-receive-pack\n';
@@ -1307,7 +1385,9 @@ function handleInfoRefs(req, res, repo, service, url) {
   const parts = [pktLine(preamble), PKT_FLUSH];
   for (const line of v0RefLines(repo, caps)) parts.push(pktLine(line));
   parts.push(PKT_FLUSH);
-  sendBytes(res, 200, Buffer.concat(parts), `application/x-${service}-advertisement`);
+  const body = Buffer.concat(parts);
+  repo._advCache = { version: repo.refsVersion, service, body };
+  sendBytes(res, 200, body, `application/x-${service}-advertisement`);
 }
 
 // One ls-refs answer line set (protocol v2).
@@ -1353,6 +1433,23 @@ function fetchResponse(repo, request) {
   return { pack, shallow };
 }
 
+// A finished fetch answer is a pure function of (framing, wants, haves,
+// shallowHeld, depth): the object graph behind it is immutable and objects
+// are never deleted, so the framed body can be cached whole. Repeat fetches
+// of one tip (the concurrent-clone pattern) become a lookup and one write.
+const fetchResponseCache = new Map();
+
+function fetchCacheKey(tag, wants, haves, shallowHeld, depth) {
+  return `${tag}\n${wants.join(' ')}\n${haves.join(' ')}\n${shallowHeld.join(' ')}\n${depth === null ? '' : depth}`;
+}
+
+function fetchCachePut(key, body) {
+  if (fetchResponseCache.size > 256) fetchResponseCache.clear();
+  fetchResponseCache.set(key, body);
+}
+
+const ACK_BODY = Buffer.concat([pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_FLUSH]);
+
 function handleUploadPack(res, repo, body) {
   const parsed = parsePktLines(body);
   if (parsed === null || parsed.packets.length === 0) {
@@ -1376,9 +1473,18 @@ function handleUploadPack(res, repo, body) {
       if (packet.kind === 'data' && afterDelim) args.push(packet.payload.toString('utf8').replace(/\n$/, ''));
     }
     if (command === 'ls-refs') {
+      // A pure function of (refs, args): cache against refsVersion.
+      const argsKey = args.join('\n');
+      const lsCache = repo._lsRefsCache;
+      if (lsCache !== undefined && lsCache.version === repo.refsVersion && lsCache.key === argsKey) {
+        sendBytes(res, 200, lsCache.body, 'application/x-git-upload-pack-result');
+        return;
+      }
       const parts = lsRefsLines(repo, args).map((line) => pktLine(line));
       parts.push(PKT_FLUSH);
-      sendBytes(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+      const body = Buffer.concat(parts);
+      repo._lsRefsCache = { version: repo.refsVersion, key: argsKey, body };
+      sendBytes(res, 200, body, 'application/x-git-upload-pack-result');
       return;
     }
     if (command === 'fetch') {
@@ -1404,8 +1510,13 @@ function handleUploadPack(res, repo, body) {
       // only; a finished request goes straight to shallow-info + packfile,
       // which is what git's own state machine expects.
       if (!done) {
-        const parts = [pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_FLUSH];
-        sendBytes(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+        sendBytes(res, 200, ACK_BODY, 'application/x-git-upload-pack-result');
+        return;
+      }
+      const cacheKey = fetchCacheKey('v2', wants, haves, shallowHeld, depth);
+      const cachedBody = fetchResponseCache.get(cacheKey);
+      if (cachedBody !== undefined) {
+        sendBytes(res, 200, cachedBody, 'application/x-git-upload-pack-result');
         return;
       }
       const { pack, shallow } = fetchResponse(repo, { wants, haves, shallowHeld, depth });
@@ -1420,7 +1531,9 @@ function handleUploadPack(res, repo, body) {
       parts.push(pktLine('packfile\n'));
       for (const packet of sidebandPackets(pack)) parts.push(packet);
       parts.push(PKT_FLUSH);
-      sendBytes(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+      const responseBody = Buffer.concat(parts);
+      fetchCachePut(cacheKey, responseBody);
+      sendBytes(res, 200, responseBody, 'application/x-git-upload-pack-result');
       return;
     }
     sendBytes(res, 400, Buffer.from(`unknown command ${command}\n`), 'text/plain');
@@ -1448,6 +1561,12 @@ function handleUploadPack(res, repo, body) {
       else if (line.startsWith('shallow ')) shallowHeld.push(line.slice(8).trim());
       else if (line.startsWith('deepen ')) depth = Number(line.slice(7).trim());
     }
+    const cacheKey = fetchCacheKey(sideband ? 'v0s' : 'v0p', wants, haves, shallowHeld, depth);
+    const cachedBody = fetchResponseCache.get(cacheKey);
+    if (cachedBody !== undefined) {
+      sendBytes(res, 200, cachedBody, 'application/x-git-upload-pack-result');
+      return;
+    }
     const { pack, shallow } = fetchResponse(repo, { wants, haves, shallowHeld, depth });
     const parts = [pktLine('NAK\n')];
     for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
@@ -1457,7 +1576,9 @@ function handleUploadPack(res, repo, body) {
       parts.push(pack);
     }
     parts.push(PKT_FLUSH);
-    sendBytes(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+    const responseBody = Buffer.concat(parts);
+    fetchCachePut(cacheKey, responseBody);
+    sendBytes(res, 200, responseBody, 'application/x-git-upload-pack-result');
     return;
   }
 
@@ -1506,8 +1627,9 @@ function handleReceivePack(res, repo, body) {
     return;
   }
   const pack = body.subarray(offset);
-  const wantsReport = capabilities.split(' ').includes('report-status');
-  const useSideband = capabilities.split(' ').includes('side-band-64k');
+  const capSet = new Set(capabilities.split(' '));
+  const wantsReport = capSet.has('report-status');
+  const useSideband = capSet.has('side-band-64k');
 
   let unpackError = null;
   if (pack.length > 0) {
@@ -1561,6 +1683,7 @@ function applyRefUpdate(repo, { oldOid, newOid, ref }) {
   }
   if (newOid === ZERO_OID) {
     repo.refs.delete(ref);
+    touchRefs(repo);
     return { ref, ok: true };
   }
   const target = getObject(newOid);
@@ -1573,6 +1696,7 @@ function applyRefUpdate(repo, { oldOid, newOid, ref }) {
     }
   }
   repo.refs.set(ref, newOid);
+  touchRefs(repo);
   return { ref, ok: true };
 }
 
@@ -1748,6 +1872,7 @@ function handleRepoRoute(req, res, url, body, repo, rest) {
       if (getObject(sha) === null) return sendJson(res, 422, { message: 'Invalid sha' });
       if (repo.refs.has(ref)) return sendJson(res, 422, { message: 'Reference already exists' });
       repo.refs.set(ref, sha);
+      touchRefs(repo);
       return sendJson(res, 201, { ref, node_id: globalId('Ref', ref), object: { sha, type: getObject(sha).type } });
     }
     if (segments.length === 2 && method === 'GET') {
@@ -1956,7 +2081,7 @@ function handleIssues(req, res, url, body, repo, segments) {
         body: typeof parsed.value.body === 'string' ? parsed.value.body : '',
         labels: labelResult.names,
       });
-      return sendJson(res, 201, issueJson(repo, issue));
+      return sendJsonBuffer(res, 201, issueJsonBuffer(repo, issue));
     }
     if (method === 'GET') {
       const state = url.searchParams.get('state') ?? 'open';
@@ -1977,7 +2102,7 @@ function handleIssues(req, res, url, body, repo, segments) {
 
   if (segments.length === 2) {
     if (issue === undefined) return sendError(res, 404, 'Issue not found');
-    if (method === 'GET') return sendJson(res, 200, issueJson(repo, issue));
+    if (method === 'GET') return sendJsonBuffer(res, 200, issueJsonBuffer(repo, issue));
     if (method === 'PATCH') {
       const parsed = parseJsonBody(body);
       if (!parsed.ok) return sendError(res, 400, 'Problems parsing JSON');
@@ -1990,7 +2115,7 @@ function handleIssues(req, res, url, body, repo, segments) {
         issue.labels = labelResult.names;
       }
       issue.updatedSec = nextStamp();
-      return sendJson(res, 200, issueJson(repo, issue));
+      return sendJsonBuffer(res, 200, issueJsonBuffer(repo, issue));
     }
     return sendError(res, 404, 'Not Found');
   }
@@ -3387,7 +3512,7 @@ async function handleRequest(req, res) {
     const path = url.pathname;
 
     if (path === '/healthz') {
-      return sendJson(res, 200, { ok: true });
+      return sendJsonBuffer(res, 200, HEALTHZ_BODY);
     }
 
     if (path === '/mcp') {
