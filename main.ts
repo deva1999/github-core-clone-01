@@ -21,7 +21,8 @@
 // derived from the contest's published scenario seed with the same generator
 // the suite uses, so the forge and the suite agree on who the viewer is.
 
-import { createServer } from 'node:http';
+import { createServer as createTcpServer } from 'node:net';
+import { Readable } from 'node:stream';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
@@ -3608,6 +3609,341 @@ async function handleRequest(req, res) {
 }
 
 // ---------------------------------------------------------------------------
+// Transport: a minimal HTTP/1.1 server on raw sockets
+// ---------------------------------------------------------------------------
+//
+// node:http's per-request machinery (llhttp object churn, the parsed-header
+// object, stream plumbing, per-request timers) is the largest per-request
+// cost left once the handlers themselves are cached and lean, and the timed
+// workloads are request/response ping-pong, so that cost is the score. The
+// handlers use a tiny surface — req.method, req.url, req.rawHeaders, body
+// via 'data'/'end'/'error', res.writeHead, res.end, res.headersSent — so
+// this layer implements exactly that surface: request line + headers,
+// Content-Length and chunked request bodies, keep-alive, 100-continue and
+// HEAD body suppression. Anything malformed closes the connection with a
+// bare 400, as node:http does.
+
+const STATUS_REASONS = {
+  200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content',
+  301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified',
+  400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found',
+  405: 'Method Not Allowed', 409: 'Conflict', 422: 'Unprocessable Entity',
+  500: 'Internal Server Error',
+};
+
+const KEEP_ALIVE_IDLE_MS = 30000;
+const MAX_HEADER_BYTES = 65536;
+
+// The Date header node:http sends, cached to one-second resolution.
+let dateCacheSec = -1;
+let dateCacheText = '';
+function dateHeaderText() {
+  const sec = Math.floor(Date.now() / 1000);
+  if (sec !== dateCacheSec) {
+    dateCacheSec = sec;
+    dateCacheText = new Date(sec * 1000).toUTCString();
+  }
+  return dateCacheText;
+}
+
+class ForgeResponse {
+  constructor(socket, method, keepAlive, onFinished) {
+    this.socket = socket;
+    this.method = method;
+    this.keepAlive = keepAlive;
+    this.onFinished = onFinished;
+    this.status = 200;
+    this.headers = null;
+    this.headersSent = false;
+    this.finished = false;
+  }
+
+  writeHead(status, headers = {}) {
+    this.status = status;
+    this.headers = headers;
+    this.headersSent = true;
+    return this;
+  }
+
+  end(body) {
+    if (this.finished) return this;
+    this.finished = true;
+    let bodyBuf = null;
+    if (body !== undefined && body !== null) {
+      bodyBuf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
+    }
+    const noBodyStatus = this.status === 204 || this.status === 304;
+    let head = `HTTP/1.1 ${this.status} ${STATUS_REASONS[this.status] ?? ''}\r\n`;
+    let hasContentLength = false;
+    if (this.headers !== null) {
+      for (const name of Object.keys(this.headers)) {
+        if (name.toLowerCase() === 'content-length') hasContentLength = true;
+        head += `${name}: ${this.headers[name]}\r\n`;
+      }
+    }
+    if (!noBodyStatus && !hasContentLength) {
+      head += `content-length: ${bodyBuf === null ? 0 : bodyBuf.length}\r\n`;
+    }
+    head += `date: ${dateHeaderText()}\r\n`;
+    if (!this.keepAlive) head += 'connection: close\r\n';
+    head += '\r\n';
+    const socket = this.socket;
+    if (!socket.destroyed) {
+      const suppressBody = noBodyStatus || this.method === 'HEAD' || bodyBuf === null || bodyBuf.length === 0;
+      try {
+        socket.cork();
+        socket.write(head, 'latin1');
+        if (!suppressBody) socket.write(bodyBuf);
+        socket.uncork();
+      } catch {
+        // The socket is gone; the response is undeliverable either way.
+      }
+    }
+    this.onFinished(this.keepAlive);
+    return this;
+  }
+}
+
+function serveConnection(socket, handler) {
+  socket.setNoDelay(true);
+  let buf = Buffer.alloc(0);
+  let closed = false;
+  let busy = false; // a request is dispatched and its response has not ended
+  let req = null; // the in-flight request Readable (body sink target)
+  let bodyMode = 'none'; // 'length' | 'chunked' | 'none'
+  let bodyLeft = 0; // bytes still owed for 'length', or for the current chunk
+  let chunkPhase = 'size'; // 'size' | 'data' | 'crlf' | 'trailer'
+  let discardBody = false; // response ended early: drop the rest of the body
+  let idleTimer = null;
+
+  const armIdleTimer = () => {
+    if (idleTimer !== null) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => socket.destroy(), KEEP_ALIVE_IDLE_MS);
+    idleTimer.unref();
+  };
+  const failBody = (error) => {
+    if (req !== null && bodyMode !== 'none') {
+      const target = req;
+      req = null;
+      bodyMode = 'none';
+      target.destroy(error);
+    }
+  };
+  socket.on('error', () => failBody(new Error('socket error')));
+  socket.on('close', () => {
+    closed = true;
+    if (idleTimer !== null) clearTimeout(idleTimer);
+    failBody(new Error('socket closed'));
+  });
+  armIdleTimer();
+
+  const finishBody = () => {
+    const target = req;
+    req = null;
+    bodyMode = 'none';
+    if (target !== null && !discardBody) target.push(null);
+    if (discardBody) {
+      discardBody = false;
+      busy = false;
+    }
+  };
+
+  // Feed buffered bytes into the in-flight request body. Returns false when
+  // more bytes are needed before anything else can happen.
+  const feedBody = () => {
+    for (;;) {
+      if (bodyMode === 'length') {
+        if (bodyLeft === 0) {
+          finishBody();
+          return true;
+        }
+        if (buf.length === 0) return false;
+        const take = Math.min(buf.length, bodyLeft);
+        const piece = buf.subarray(0, take);
+        buf = buf.subarray(take);
+        bodyLeft -= take;
+        if (!discardBody && req !== null) req.push(piece);
+        if (bodyLeft === 0) {
+          finishBody();
+          return true;
+        }
+        return false;
+      }
+      if (bodyMode === 'chunked') {
+        if (chunkPhase === 'size') {
+          const lineEnd = buf.indexOf('\r\n');
+          if (lineEnd === -1) return false;
+          const sizeText = buf.toString('latin1', 0, lineEnd).split(';', 1)[0].trim();
+          const size = Number.parseInt(sizeText, 16);
+          if (!Number.isFinite(size) || size < 0) {
+            socket.destroy();
+            return false;
+          }
+          buf = buf.subarray(lineEnd + 2);
+          if (size === 0) {
+            chunkPhase = 'trailer';
+          } else {
+            bodyLeft = size;
+            chunkPhase = 'data';
+          }
+          continue;
+        }
+        if (chunkPhase === 'data') {
+          if (buf.length === 0) return false;
+          const take = Math.min(buf.length, bodyLeft);
+          const piece = buf.subarray(0, take);
+          buf = buf.subarray(take);
+          bodyLeft -= take;
+          if (!discardBody && req !== null) req.push(piece);
+          if (bodyLeft === 0) chunkPhase = 'crlf';
+          continue;
+        }
+        if (chunkPhase === 'crlf') {
+          if (buf.length < 2) return false;
+          buf = buf.subarray(2);
+          chunkPhase = 'size';
+          continue;
+        }
+        // trailer: lines until an empty line ends the body
+        const lineEnd = buf.indexOf('\r\n');
+        if (lineEnd === -1) return false;
+        buf = buf.subarray(lineEnd + 2);
+        if (lineEnd === 0) {
+          chunkPhase = 'size';
+          finishBody();
+          return true;
+        }
+        continue;
+      }
+      return true;
+    }
+  };
+
+  const dispatch = (headText) => {
+    const lines = headText.split('\r\n');
+    const requestLine = lines[0].split(' ');
+    if (requestLine.length !== 3 || !requestLine[2].startsWith('HTTP/')) {
+      try {
+        socket.write('HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n', 'latin1');
+      } catch {
+        // already gone
+      }
+      closed = true;
+      socket.destroy();
+      return;
+    }
+    const [method, target, version] = requestLine;
+    const rawHeaders = [];
+    let contentLength = 0;
+    let chunked = false;
+    let expectContinue = false;
+    let connectionToken = '';
+    for (let i = 1; i < lines.length; i += 1) {
+      const line = lines[i];
+      const colon = line.indexOf(':');
+      if (colon <= 0) continue;
+      const name = line.slice(0, colon);
+      const value = line.slice(colon + 1).trim();
+      rawHeaders.push(name, value);
+      const lower = name.toLowerCase();
+      if (lower === 'content-length') {
+        const parsed = Number.parseInt(value, 10);
+        contentLength = Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+      } else if (lower === 'transfer-encoding') {
+        if (value.toLowerCase().includes('chunked')) chunked = true;
+      } else if (lower === 'expect') {
+        if (value.toLowerCase().includes('100-continue')) expectContinue = true;
+      } else if (lower === 'connection') {
+        connectionToken = value.toLowerCase();
+      }
+    }
+    let keepAlive;
+    if (connectionToken.includes('close')) keepAlive = false;
+    else if (version === 'HTTP/1.0') keepAlive = connectionToken.includes('keep-alive');
+    else keepAlive = true;
+
+    const request = new Readable({ read() {} });
+    request.method = method;
+    request.url = target;
+    request.rawHeaders = rawHeaders;
+    req = request;
+    busy = true;
+    discardBody = false;
+    if (chunked) {
+      bodyMode = 'chunked';
+      chunkPhase = 'size';
+      bodyLeft = 0;
+    } else if (contentLength > 0) {
+      bodyMode = 'length';
+      bodyLeft = contentLength;
+    } else {
+      bodyMode = 'none';
+      request.push(null);
+      req = null;
+    }
+    if (expectContinue && !socket.destroyed) {
+      try {
+        socket.write('HTTP/1.1 100 Continue\r\n\r\n', 'latin1');
+      } catch {
+        // already gone
+      }
+    }
+    const res = new ForgeResponse(socket, method, keepAlive, (keep) => {
+      if (!keep) {
+        closed = true;
+        socket.end();
+        return;
+      }
+      if (bodyMode !== 'none') {
+        // The handler answered before the body arrived in full: drain and
+        // drop the rest before the next request on this connection.
+        discardBody = true;
+      } else {
+        busy = false;
+      }
+      armIdleTimer();
+      pump();
+    });
+    handler(request, res);
+  };
+
+  const pump = () => {
+    for (;;) {
+      if (closed || socket.destroyed) return;
+      if (bodyMode !== 'none') {
+        if (!feedBody()) return;
+        continue;
+      }
+      if (busy) return;
+      const headerEnd = buf.indexOf('\r\n\r\n');
+      if (headerEnd === -1) {
+        if (buf.length > MAX_HEADER_BYTES) socket.destroy();
+        return;
+      }
+      const headText = buf.toString('latin1', 0, headerEnd);
+      buf = buf.subarray(headerEnd + 4);
+      dispatch(headText);
+    }
+  };
+
+  socket.on('data', (chunk) => {
+    if (idleTimer !== null) clearTimeout(idleTimer);
+    buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+    pump();
+  });
+}
+
+function createForgeServer(handler) {
+  const tcp = createTcpServer((socket) => serveConnection(socket, handler));
+  return {
+    listen: (...args) => tcp.listen(...args),
+    close: (...args) => tcp.close(...args),
+    address: () => tcp.address(),
+    on: (...args) => tcp.on(...args),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -3649,15 +3985,13 @@ async function waitForDone(envUrl) {
 }
 
 async function main() {
-  // requestTimeout/headersTimeout at 0: no per-request timers (the trial
-  // harness runs its own deadlines and kills the pod at the wall budget).
-  // TCP_NODELAY on every accepted socket: the workloads are request/response
-  // ping-pong, so a queued segment must never wait for an ACK.
-  const server = createServer({ requestTimeout: 0, headersTimeout: 0 }, (req, res) => {
+  // The transport is the forge's own minimal HTTP/1.1 layer (above): no
+  // per-request timers, TCP_NODELAY on every socket, a 30 s idle close for
+  // keep-alive connections — the trial harness runs its own deadlines and
+  // kills the pod at the wall budget regardless.
+  const server = createForgeServer((req, res) => {
     void handleRequest(req, res);
   });
-  server.on('connection', (socket) => socket.setNoDelay(true));
-  server.keepAliveTimeout = 30000;
 
   const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
   if (envUrl === '') {
