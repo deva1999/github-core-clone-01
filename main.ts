@@ -1251,9 +1251,20 @@ const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const EXPECTED_AUTH = SHOP_TOKEN === '' ? null : `Bearer ${SHOP_TOKEN}`;
 const EXPECTED_AUTH_BUF = EXPECTED_AUTH === null ? null : Buffer.from(EXPECTED_AUTH, 'utf8');
 
+// One header's value from the raw header list, without building the
+// parsed headers object (Node builds that object lazily on first access
+// and it is one of the most expensive per-request steps left).
+function headerOf(req, name) {
+  const raw = req.rawHeaders;
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    if (raw[i] === name || raw[i].toLowerCase() === name) return raw[i + 1];
+  }
+  return undefined;
+}
+
 function tokenOk(req) {
   if (EXPECTED_AUTH === null) return true; // standalone dev mode: no token configured
-  const header = req.headers.authorization ?? '';
+  const header = headerOf(req, 'authorization') ?? '';
   if (header.length !== EXPECTED_AUTH.length) return false;
   return timingSafeEqual(Buffer.from(header, 'utf8'), EXPECTED_AUTH_BUF);
 }
@@ -1368,7 +1379,7 @@ function handleInfoRefs(req, res, repo, service, url) {
     sendBytes(res, 400, Buffer.from('invalid service\n'), 'text/plain');
     return;
   }
-  const wantsV2 = (req.headers['git-protocol'] ?? '').includes('version=2');
+  const wantsV2 = (headerOf(req, 'git-protocol') ?? '').includes('version=2');
   if (service === 'git-upload-pack' && wantsV2) {
     sendBytes(res, 200, UPLOAD_V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
     return;
@@ -1727,7 +1738,7 @@ function paginate(items, url, basePath, origin) {
 }
 
 function requestOrigin(req) {
-  return `http://${req.headers.host ?? 'localhost'}`;
+  return `http://${headerOf(req, 'host') ?? 'localhost'}`;
 }
 
 function handleRest(req, res, url, body) {
@@ -3506,9 +3517,26 @@ function handleMcp(req, res, body) {
 // Router
 // ---------------------------------------------------------------------------
 
+// Fast request-target parse for the common origin-form target: WHATWG URL
+// parsing is one of the most expensive per-request steps in Node, and the
+// handlers only ever read .pathname and .searchParams. Anything the fast
+// path cannot reproduce exactly (percent-escapes, dot segments, fragments,
+// backslashes, protocol-relative or non-origin-form targets) falls back to
+// the real URL parser, so routing semantics never change.
+function parseTarget(raw) {
+  if (raw.startsWith('/') && !raw.startsWith('//') && !raw.includes('\\') && !raw.includes('#')) {
+    const q = raw.indexOf('?');
+    const pathname = q === -1 ? raw : raw.slice(0, q);
+    if (!pathname.includes('%') && !pathname.includes('/.')) {
+      return { pathname, searchParams: new URLSearchParams(q === -1 ? '' : raw.slice(q + 1)) };
+    }
+  }
+  return new URL(raw, 'http://forge.invalid');
+}
+
 async function handleRequest(req, res) {
   try {
-    const url = new URL(req.url ?? '/', 'http://forge.invalid');
+    const url = parseTarget(req.url ?? '/');
     const path = url.pathname;
 
     if (path === '/healthz') {
@@ -3621,11 +3649,15 @@ async function waitForDone(envUrl) {
 }
 
 async function main() {
-  const server = createServer((req, res) => {
+  // requestTimeout/headersTimeout at 0: no per-request timers (the trial
+  // harness runs its own deadlines and kills the pod at the wall budget).
+  // TCP_NODELAY on every accepted socket: the workloads are request/response
+  // ping-pong, so a queued segment must never wait for an ACK.
+  const server = createServer({ requestTimeout: 0, headersTimeout: 0 }, (req, res) => {
     void handleRequest(req, res);
   });
+  server.on('connection', (socket) => socket.setNoDelay(true));
   server.keepAliveTimeout = 30000;
-  server.headersTimeout = 60000;
 
   const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
   if (envUrl === '') {
