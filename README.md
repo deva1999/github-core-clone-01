@@ -1,8 +1,13 @@
-# github-core-clone-01 — a standalone GitHub-compatible git forge
+# github-core-clone-01
 
-One process, one file (`main.ts`), Node.js standard library only — no git
-binary, no package manager, no outside service. It serves four surfaces from
-a single in-memory store:
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/deva1999/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/deva1999/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+A standalone GitHub-compatible git forge. One process, one file
+(`main.ts`), Node.js standard library only — no git binary, no package
+manager, no outside service. It serves four surfaces from a single
+in-memory store:
 
 - **Git smart HTTP** at `/{owner}/{repo}.git` — upload-pack protocol v2
   (capability advertisement, `ls-refs`, `fetch` with shallow/deepen support)
@@ -31,6 +36,12 @@ Every API call is authorized with `Authorization: Bearer
 $MAKEFUN_SHOP_TOKEN`; the token's login owns every repository, and the same
 name under another owner is a 404.
 
+## Run it
+
+```sh
+node main.ts
+```
+
 ## Lifecycle
 
 Started as `node main.ts` (Node 22). With `MAKEFUN_ENV_URL` set (the trial
@@ -53,3 +64,7 @@ results.
   lifecycle).
 - `package.json` — module metadata (`"type": "module"`).
 - `.makefun/owner.json` — the make.fun claim file naming the entrant wallet.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=gx4yrk51&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
